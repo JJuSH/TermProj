@@ -17,7 +17,7 @@ gym.logger.set_level(gym.logger.ERROR)
 
 from atari_data import get_human_normalized_score
 from atari_preprocessing import AtariPreprocessing
-
+import pdb
 # --- Setup
 seed = 100
 random.seed(seed)
@@ -33,7 +33,7 @@ torch.manual_seed(seed)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Hide GPU from tf, since tf.io.encode_jpeg/decode_jpeg seem to cause GPU memory leak.
-tf.config.set_visible_devices([], "GPU")
+#tf.config.set_visible_devices([], "GPU")
 
 # --- Create environments
 class SequenceEnvironmentWrapper(gym.Wrapper):
@@ -215,8 +215,73 @@ model_params, model_state = pickle.load(open("checkpoint_38274228.pkl", "rb"))
 load_jax_weights(model, model_params)
 model = model.to(device=device)
 
+# --- create dataset 
+
 # --- Train model
+
 model.train()
+
+print("###############")
+
+from create_dataset import create_dataset
+from multigame_dt_trainer import Trainer, TrainerConfig
+from torch.utils.data import Dataset
+
+pdb.set_trace()
+class StateActionReturnDataset(Dataset):
+
+    def __init__(self, data, block_size, actions, done_idxs, rtgs, timesteps):        
+        self.block_size = block_size
+        self.vocab_size = max(actions) + 1
+        self.data = data
+        self.actions = actions
+        self.done_idxs = done_idxs
+        self.rtgs = rtgs
+        self.timesteps = timesteps
+    
+    def __len__(self):
+        return len(self.data) - self.block_size
+
+    def __getitem__(self, idx):
+        block_size = self.block_size // 3
+        done_idx = idx + block_size
+        for i in self.done_idxs:
+            if i > idx: # first done_idx greater than idx
+                done_idx = min(int(i), done_idx)
+                break
+        idx = done_idx - block_size
+        states = torch.tensor(np.array(self.data[idx:done_idx]), dtype=torch.float32).reshape(block_size, -1) # (block_size, 4*84*84)
+        states = states / 255.
+        actions = torch.tensor(self.actions[idx:done_idx], dtype=torch.long).unsqueeze(1) # (block_size, 1)
+        rtgs = torch.tensor(self.rtgs[idx:done_idx], dtype=torch.float32).unsqueeze(1)
+        timesteps = torch.tensor(self.timesteps[idx:idx+1], dtype=torch.int64).unsqueeze(1)
+
+        return states, actions, rtgs, timesteps
+
+# python run_dt_atari.py --seed $seed --context_length 50 --epochs 5 --model_type 'reward_conditioned' --num_steps 500000 --num_buffers 50 --game 'Pong' --batch_size 512
+
+epochs = 5
+num_steps = 200000
+num_buffers = 50
+game = 'Pong'
+batch_size = 512
+data_dir_prefix = './dqn_replay/'
+trajectories_per_buffer = 10
+context_length = 30
+seed = 123
+model_type = 'reward_conditioned'
+
+obss, actions, returns, done_idxs, rtgs, timesteps = create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_per_buffer)
+train_dataset = StateActionReturnDataset(obss, context_length*3, actions, done_idxs, rtgs, timesteps)
+
+tconf = TrainerConfig(max_epochs=epochs, batch_size=batch_size, learning_rate=6e-4,
+                      lr_decay=True, warmup_tokens=512*20, final_tokens=2*len(train_dataset)*context_length*3,
+                      num_workers=4, seed=seed, model_type=model_type, game=game, max_timestep=max(timesteps))
+trainer = Trainer(model, train_dataset, None, tconf)
+
+trainer.train()
+
+
 
 # --- Save/Load model weights
 # torch.save(model.state_dict(), "model.pth")
