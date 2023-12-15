@@ -5,6 +5,7 @@ import scipy
 import torch
 import torch.nn as nn
 from torch import Tensor
+import pdb
 
 from multigame_dt_utils import (
     accuracy,
@@ -80,6 +81,7 @@ class Attention(nn.Module):
             nn.init.zeros_(self.proj.bias)
 
     def forward(self, x, mask: Optional[Tensor] = None) -> Tensor:
+        pdb.set_trace()
         B, T, C = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
@@ -105,6 +107,7 @@ class CausalSelfAttention(Attention):
         custom_causal_mask: Optional[Tensor] = None,
         prefix_length: Optional[int] = 0,
     ) -> Tensor:
+        
         if x.ndim != 3:
             raise ValueError("Expect queries of shape [B, T, D].")
 
@@ -136,6 +139,7 @@ class Block(nn.Module):
         self.dropout_2 = nn.Dropout(dropout_rate)
 
     def forward(self, x, **kwargs):
+        
         x = x + self.dropout_1(self.attn(self.ln_1(x), **kwargs))
         x = x + self.dropout_2(self.mlp(self.ln_2(x)))
         return x
@@ -165,13 +169,13 @@ class Transformer(nn.Module):
 
     def forward(
         self,
-        h: Tensor,
-        mask: Optional[Tensor] = None,
-        custom_causal_mask: Optional[Tensor] = None,
+        h: Tensor,  # 8 x 156 x 1280
+        mask: Optional[Tensor] = None,  # 8 x 156
+        custom_causal_mask: Optional[Tensor] = None,    # 156 x 156
         prefix_length: Optional[int] = 0,
     ) -> Tensor:
         r"""Connects the transformer.
-
+        
         Args:
         h: Inputs, [B, T, D].
         mask: Padding mask, [B, T].
@@ -181,20 +185,24 @@ class Transformer(nn.Module):
         Returns:
         Array of shape [B, T, D].
         """
+
+        
         if mask is not None:
             # Make sure we're not passing any information about masked h.
-            h = h * mask[:, :, None]
-            mask = mask[:, None, None, :]
+            h = h * mask[:, :, None]  ## 8 x 156 x 1280     # 8 x 156 x 1
+            mask = mask[:, None, None, :]   # 8 x 1 x 1 x 156
 
         for block in self.layers:
             h = block(
                 h,
                 mask=mask,
-                custom_causal_mask=custom_causal_mask,
-                prefix_length=prefix_length,
+                custom_causal_mask=custom_causal_mask,   # 156 x 156
+                prefix_length=prefix_length,   # 0
             )
         h = self.norm_f(h)
         return h
+
+
 
 
 class MultiGameDecisionTransformer(nn.Module):
@@ -297,17 +305,18 @@ class MultiGameDecisionTransformer(nn.Module):
         Returns:
             Image embedding of shape [B x T x output_dim] or [B x T x _ x output_dim].
         """
-        assert len(image.shape) == 5
+        image = torch.unsqueeze(image, -3)
+        assert len(image.shape) == 6   # batch x seq_len x 4 x 1 x 84 x 84
 
-        image_dims = image.shape[-3:]
-        batch_dims = image.shape[:2]
+        image_dims = image.shape[-3:] # 1 x 84 x 84
+        batch_dims = image.shape[:3] # batch x seq_len x 4
 
         # Reshape to [BT x C x H x W].
         image = torch.reshape(image, (-1,) + image_dims)
         # Perform any-image specific processing.
         image = image.to(dtype=torch.float32) / 255.0
 
-        image_emb = self.image_emb(image)  # [BT x D x P x P]
+        image_emb = self.image_emb(image)  # [BT x D x P x P] # 32 x 1280 x 6 x 6
         # haiku.Conv2D is channel-last, so permute before reshape below for consistency
         image_emb = image_emb.permute(0, 2, 3, 1)  # [BT x P x P x D]
 
@@ -318,8 +327,52 @@ class MultiGameDecisionTransformer(nn.Module):
 
     def _embed_inputs(self, obs: Tensor, ret: Tensor, act: Tensor, rew: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         # Embed only prefix_frames first observations.
-        # obs are [B x T x C x H x W].
-        obs_emb = self._image_embedding(obs)
+        # obs are [B x T x C x H x W]
+        obs_emb = self._image_embedding(obs) # obs_emb : torch.Size([64, 30, 4, 36, 1280]) 
+        # Embed returns and actions
+        # Encode returns.
+        ret = encode_return(ret, self.return_range)
+        rew = encode_reward(rew)
+        ret_emb = self.ret_emb(ret)          # ret_emb : torch.Size([64, 30, 4, 1280])
+        act_emb = self.act_emb(act)          # act_emb : torch.Size([64, 30, 4, 1280])
+        if self.predict_reward:
+            rew_emb = self.rew_emb(rew)      # rew_emb : torch.Size([64, 30, 4, 1280])
+        else:
+            rew_emb = None
+        return obs_emb, ret_emb, act_emb, rew_emb   
+
+    def _image_embedding_inf(self, image: Tensor):
+        r"""Embed [B x T x C x W x H] images to tokens [B x T x output_dim] tokens.
+
+        Args:
+            image: [B x T x C x W x H] image to embed.
+
+        Returns:
+            Image embedding of shape [B x T x output_dim] or [B x T x _ x output_dim].
+        """
+        assert len(image.shape) == 5
+
+        image_dims = image.shape[-3:] # 1 x 84 x 84
+        batch_dims = image.shape[:2] # 8 x 4
+
+        # Reshape to [BT x C x H x W].
+        image = torch.reshape(image, (-1,) + image_dims)
+        # Perform any-image specific processing.
+        image = image.to(dtype=torch.float32) / 255.0
+
+        image_emb = self.image_emb(image)  # [BT x D x P x P] # 32 x 1280 x 6 x 6
+        # haiku.Conv2D is channel-last, so permute before reshape below for consistency
+        image_emb = image_emb.permute(0, 2, 3, 1)  # [BT x P x P x D]
+
+        # Reshape to [B x T x P*P x D].
+        image_emb = torch.reshape(image_emb, batch_dims + (-1, self.d_model))
+        image_emb = image_emb + self.image_pos_enc
+        return image_emb
+
+    def _embed_inputs_inf(self, obs: Tensor, ret: Tensor, act: Tensor, rew: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        # Embed only prefix_frames first observations.
+        # obs are [B x T x C x H x W]
+        obs_emb = self._image_embedding_inf(obs) # obs : 8 x 4 x 1 x 84 x 84 
         # Embed returns and actions
         # Encode returns.
         ret = encode_return(ret, self.return_range)
@@ -333,36 +386,191 @@ class MultiGameDecisionTransformer(nn.Module):
         return obs_emb, ret_emb, act_emb, rew_emb
 
     def forward(self, inputs: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
+
+        
         r"""Process sequence."""
         num_batch = inputs["actions"].shape[0]
-        num_steps = inputs["actions"].shape[1]
+        num_steps = inputs["actions"].shape[2]
+        num_seq = inputs["actions"].shape[1]
+        
         # Embed inputs.
+        # obs_emb : torch.Size([8, 4, 36, 1280])
+        # ret_emb : torch.Size([8, 4, 1280])
+        # act_emb : torch.Size([8, 4, 1280])
+        # rew_emb : torch.Size([8, 4, 1280])
+
+
+        # seq embed inputs
+        # obs_emb : torch.Size([64, 30, 4, 36, 1280])
+        # ret_emb : torch.Size([64, 30, 4, 1280])
+        # act_emb : torch.Size([64, 30, 4, 1280])
+        # rew_emb : torch.Size([64, 30, 4, 1280])
+
+        
+
         obs_emb, ret_emb, act_emb, rew_emb = self._embed_inputs(
-            inputs["observations"],
-            inputs["returns-to-go"],
-            inputs["actions"],
-            inputs["rewards"],
+            inputs["observations"],   # torch.Size([8, 4, 1, 84, 84])    ->    128, 30, 4, 84, 84
+            inputs["returns-to-go"],  # torch.Size([8, 4])               ->    128, 30, 4
+            inputs["actions"],        # torch.Size([8, 4])               ->    128, 30, 4
+            inputs["rewards"],        # torch.Size([8, 4])               ->    128, 30, 4
         )
         device = obs_emb.device
 
+
         if self.spatial_tokens:
             # obs is [B x T x W x D]
-            num_obs_tokens = obs_emb.shape[2]
-            obs_emb = torch.reshape(obs_emb, obs_emb.shape[:2] + (-1,))
+            #num_obs_tokens = obs_emb.shape[2] # 36
+            num_obs_tokens = obs_emb.shape[3]
+            #obs_emb = torch.reshape(obs_emb, obs_emb.shape[:2] + (-1,))  # torch.Size([8, 4, 46080])
+            obs_emb = torch.reshape(obs_emb, obs_emb.shape[:3] + (-1,))  # torch.Size([64, 30, 4, 46080])
             # obs is [B x T x W*D]
         else:
             num_obs_tokens = 1
         # Collect sequence.
         # Embeddings are [B x T x D].
         if self.predict_reward:
-            token_emb = torch.cat([obs_emb, ret_emb, act_emb, rew_emb], dim=-1)
+            token_emb = torch.cat([obs_emb, ret_emb, act_emb, rew_emb], dim=-1)  # token_emb.shape : torch.Size([8, 4, 49920]) -> torch.Size([64, 30, 4, 49920])
             tokens_per_step = num_obs_tokens + 3
             # sequence is [obs ret act rew ... obs ret act rew]
         else:
             token_emb = torch.cat([obs_emb, ret_emb, act_emb], dim=-1)
             tokens_per_step = num_obs_tokens + 2
             # sequence is [obs ret act ... obs ret act]
-        token_emb = torch.reshape(token_emb, [num_batch, tokens_per_step * num_steps, self.d_model])
+        
+        #token_emb = torch.reshape(token_emb, [num_batch, tokens_per_step * num_steps, self.d_model]) # num_batch : 8, tokens_per_step : 39, num_steps : 4
+        token_emb = torch.reshape(token_emb, [num_batch, num_seq, tokens_per_step * num_steps, self.d_model]) # torch.Size([64, 30, 156, 1280])
+
+        # Create position embeddings.
+        token_emb = token_emb + self.positional_embedding
+
+        token_emb = torch.reshape(token_emb, [num_batch, num_seq * tokens_per_step * num_steps, self.d_model]) # torch.Size([64, 30 * 156, 1280])
+        # Run the transformer over the inputs.
+
+        # Token dropout.
+        batch_size = token_emb.shape[0]
+        #obs_mask = np.ones([batch_size, num_steps, num_obs_tokens], dtype=bool)
+        #ret_mask = np.ones([batch_size, num_steps, 1], dtype=bool)
+        #act_mask = np.ones([batch_size, num_steps, 1], dtype=bool) # (8, 4, 1)
+        #rew_mask = np.ones([batch_size, num_steps, 1], dtype=bool)
+
+        obs_mask = np.ones([batch_size, num_seq, num_steps, num_obs_tokens], dtype=bool)  # (64, 30, 4, 36)
+        ret_mask = np.ones([batch_size, num_seq, num_steps, 1], dtype=bool) # (64, 30, 4, 1)
+        act_mask = np.ones([batch_size, num_seq, num_steps, 1], dtype=bool) # (64, 30, 4, 1)
+        rew_mask = np.ones([batch_size, num_seq, num_steps, 1], dtype=bool) # (64, 30, 4, 1)
+
+
+        if self.single_return_token:
+            # Mask out all return tokens expect the first one.
+            #ret_mask[:, 1:] = 0
+            ret_mask[:, :, 1:] = 0
+        if self.predict_reward:
+            mask = [obs_mask, ret_mask, act_mask, rew_mask]
+        else:
+            mask = [obs_mask, ret_mask, act_mask]
+        mask = np.concatenate(mask, axis=-1)
+        #mask = np.reshape(mask, [batch_size, tokens_per_step * num_steps])
+        #mask = np.reshape(mask, [batch_size, num_seq, tokens_per_step * num_steps]) # (64, 30, 156)
+
+        mask = np.reshape(mask, [batch_size, num_seq * tokens_per_step * num_steps]) # (64, 30 * 156)
+        mask = torch.tensor(mask, dtype=torch.bool, device=device)
+
+        custom_causal_mask = None
+        if self.spatial_tokens:
+            # Temporal transformer by default assumes sequential causal relation.
+            # This makes the transformer causal mask a lower triangular matrix.
+            #     P1 P2 R  a  P1 P2 ... (Ps: image patches)
+            # P1  1  0* 0  0  0  0
+            # P2  1  1  0  0  0  0
+            # R   1  1  1  0  0  0
+            # a   1  1  1  1  0  0
+            # P1  1  1  1  1  1  0*
+            # P2  1  1  1  1  1  1
+            # ... (0*s should be replaced with 1s in the ideal case)
+            # But, when we have multiple tokens for an image (e.g. patch tokens, conv
+            # feature map tokens, etc) as inputs to transformer, this assumption does
+            # not hold, because there is no sequential dependencies between tokens.
+            # Therefore, the ideal causal mask should not mask out tokens that belong
+            # to the same images from each others.
+            #seq_len = token_emb.shape[1] # tokens_per_step * num_steps : 156
+            
+
+            seq_len = token_emb.shape[1]  # 30 * tokens_per_step * num_steps : 156
+            sequential_causal_mask = np.tril(np.ones((seq_len, seq_len))) # 156 x 156
+            num_timesteps = seq_len // tokens_per_step # 4
+            num_non_obs_tokens = tokens_per_step - num_obs_tokens   # tokens_per_step : 39 num_obs_token : 36    -> 3
+            diag = [
+                np.ones((num_obs_tokens, num_obs_tokens)) if i % 2 == 0 else np.zeros((num_non_obs_tokens, num_non_obs_tokens))
+                for i in range(num_timesteps * 2)
+            ]
+            block_diag = scipy.linalg.block_diag(*diag) # (156, 156)
+            custom_causal_mask = np.logical_or(sequential_causal_mask, block_diag)
+            custom_causal_mask = torch.tensor(custom_causal_mask, dtype=torch.bool, device=device)
+
+            #custom_causal_mask = custom_causal_mask.repeat(num_seq, 0)
+
+      
+        output_emb = self.transformer(token_emb, mask, custom_causal_mask) # torch.Size([64, 30, 156, 1280])    mask : torch.Size([64, 30, 156])      custom_causal_mask : torch.Size([156, 156])
+
+        # Output_embeddings are [B x 3T x D].   8 x 156 x 1280
+        # Next token predictions (tokens one before their actual place).
+        ret_pred = output_emb[:, (num_obs_tokens - 1) :: tokens_per_step, :]
+        act_pred = output_emb[:, (num_obs_tokens - 0) :: tokens_per_step, :]
+        embeds = torch.cat([ret_pred, act_pred], dim=-1)
+        # Project to appropriate dimensionality.
+        ret_pred = self.ret_linear(ret_pred)
+        act_pred = self.act_linear(act_pred)
+        # Return logits as well as pre-logits embedding.
+        result_dict = {
+            "embeds": embeds,
+            "action_logits": act_pred,   #(8, 4, 18)
+            "return_logits": ret_pred,
+        }
+        if self.predict_reward:
+            rew_pred = output_emb[:, (num_obs_tokens + 1) :: tokens_per_step, :]
+            rew_pred = self.rew_linear(rew_pred)
+            result_dict["reward_logits"] = rew_pred
+        # Return evaluation metrics.
+        result_dict["loss"] = self.sequence_loss(inputs, result_dict)
+        result_dict["accuracy"] = self.sequence_accuracy(inputs, result_dict)
+        return result_dict
+
+    def forward_inf(self, inputs: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
+
+        #pdb.set_trace()
+        r"""Process sequence."""
+        num_batch = inputs["actions"].shape[0]
+        num_steps = inputs["actions"].shape[1]
+        # Embed inputs.
+        # obs_emb : torch.Size([8, 4, 36, 1280])
+        # ret_emb : torch.Size([8, 4, 1280])
+        # act_emb : torch.Size([8, 4, 1280])
+        # rew_emb : torch.Size([8, 4, 1280])
+        obs_emb, ret_emb, act_emb, rew_emb = self._embed_inputs_inf(
+            inputs["observations"],   # torch.Size([8, 4, 1, 84, 84])
+            inputs["returns-to-go"],  # torch.Size([8, 4])
+            inputs["actions"],        # torch.Size([8, 4])
+            inputs["rewards"],        # torch.Size([8, 4])
+        )
+        device = obs_emb.device
+
+        if self.spatial_tokens:
+            # obs is [B x T x W x D]
+            num_obs_tokens = obs_emb.shape[2] # 36
+            obs_emb = torch.reshape(obs_emb, obs_emb.shape[:2] + (-1,))  # torch.Size([8, 4, 46080])
+            # obs is [B x T x W*D]
+        else:
+            num_obs_tokens = 1
+        # Collect sequence.
+        # Embeddings are [B x T x D].
+        if self.predict_reward:
+            token_emb = torch.cat([obs_emb, ret_emb, act_emb, rew_emb], dim=-1)  # token_emb.shape : torch.Size([8, 4, 49920])
+            tokens_per_step = num_obs_tokens + 3
+            # sequence is [obs ret act rew ... obs ret act rew]
+        else:
+            token_emb = torch.cat([obs_emb, ret_emb, act_emb], dim=-1)
+            tokens_per_step = num_obs_tokens + 2
+            # sequence is [obs ret act ... obs ret act]
+        token_emb = torch.reshape(token_emb, [num_batch, tokens_per_step * num_steps, self.d_model]) # num_batch : 8, tokens_per_step : 39, num_steps : 4
         # Create position embeddings.
         token_emb = token_emb + self.positional_embedding
         # Run the transformer over the inputs.
@@ -371,7 +579,7 @@ class MultiGameDecisionTransformer(nn.Module):
         batch_size = token_emb.shape[0]
         obs_mask = np.ones([batch_size, num_steps, num_obs_tokens], dtype=bool)
         ret_mask = np.ones([batch_size, num_steps, 1], dtype=bool)
-        act_mask = np.ones([batch_size, num_steps, 1], dtype=bool)
+        act_mask = np.ones([batch_size, num_steps, 1], dtype=bool) # (8, 4, 1)
         rew_mask = np.ones([batch_size, num_steps, 1], dtype=bool)
         if self.single_return_token:
             # Mask out all return tokens expect the first one.
@@ -381,7 +589,7 @@ class MultiGameDecisionTransformer(nn.Module):
         else:
             mask = [obs_mask, ret_mask, act_mask]
         mask = np.concatenate(mask, axis=-1)
-        mask = np.reshape(mask, [batch_size, tokens_per_step * num_steps])
+        mask = np.reshape(mask, [batch_size, tokens_per_step * num_steps])  # 8 x 4 x 39 -> 8 x 156 frame마다 39개씩 concat
         mask = torch.tensor(mask, dtype=torch.bool, device=device)
 
         custom_causal_mask = None
@@ -413,9 +621,10 @@ class MultiGameDecisionTransformer(nn.Module):
             custom_causal_mask = np.logical_or(sequential_causal_mask, block_diag)
             custom_causal_mask = torch.tensor(custom_causal_mask, dtype=torch.bool, device=device)
 
-        output_emb = self.transformer(token_emb, mask, custom_causal_mask)
+        pdb.set_trace()
+        output_emb = self.transformer(token_emb, mask, custom_causal_mask) # token_emb : 8 x 156 x 1280       mask : torch.Size([8, 156])       custom_causal_mask : torch.Size([156, 156]
 
-        # Output_embeddings are [B x 3T x D].
+        # Output_embeddings are [B x 3T x D].   8 x 156 x 1280
         # Next token predictions (tokens one before their actual place).
         ret_pred = output_emb[:, (num_obs_tokens - 1) :: tokens_per_step, :]
         act_pred = output_emb[:, (num_obs_tokens - 0) :: tokens_per_step, :]
@@ -426,7 +635,7 @@ class MultiGameDecisionTransformer(nn.Module):
         # Return logits as well as pre-logits embedding.
         result_dict = {
             "embeds": embeds,
-            "action_logits": act_pred,
+            "action_logits": act_pred,   #(8, 4, 18)
             "return_logits": ret_pred,
         }
         if self.predict_reward:
@@ -481,8 +690,8 @@ class MultiGameDecisionTransformer(nn.Module):
         deterministic: bool = False,
     ):
         r"""Calculate optimal action for the given sequence model."""
-        logits_fn = self.forward
-        obs, act, rew = inputs["observations"], inputs["actions"], inputs["rewards"]
+        logits_fn = self.forward_inf
+        obs, act, rew = inputs["observations"], inputs["actions"], inputs["rewards"] # obs : 8 x 4 x 1 x 84 x 84
         assert len(obs.shape) == 5
         assert len(act.shape) == 2
         inputs = {
@@ -491,7 +700,7 @@ class MultiGameDecisionTransformer(nn.Module):
             "rewards": rew,
             "returns-to-go": torch.zeros_like(act),
         }
-        sequence_length = obs.shape[1]
+        sequence_length = obs.shape[1] # 4
         # Use samples from the last timestep.
         timestep = -1
         # A biased sampling function that prefers sampling larger returns.
@@ -539,7 +748,7 @@ class MultiGameDecisionTransformer(nn.Module):
             inputs["returns-to-go"] = ret_sample
 
         # Generate a sample from action logits.
-        act_logits = logits_fn(inputs)["action_logits"][:, timestep, :]
+        act_logits = logits_fn(inputs)["action_logits"][:, timestep, :]   #timestep : -1 
         act_sample = sample_from_logits(
             act_logits,
             generator=rng,
@@ -548,3 +757,54 @@ class MultiGameDecisionTransformer(nn.Module):
             top_percentile=action_top_percentile,
         )
         return act_sample
+
+    def configure_optimizers(self, train_config):
+        """
+        This long function is unfortunately doing something very simple and is being very defensive:
+        We are separating out all parameters of the model into two buckets: those that will experience
+        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
+        We are then returning the PyTorch optimizer object.
+        """
+
+        # separate out all parameters to those that will and won't experience regularizing weight decay
+        decay = set()
+        no_decay = set()
+        # whitelist_weight_modules = (torch.nn.Linear, )
+        whitelist_weight_modules = (torch.nn.Linear, torch.nn.Conv2d)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
+
+                if pn.endswith('bias'):
+                    # all biases will not be decayed
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    # weights of whitelist modules will be weight decayed
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    # weights of blacklist modules will NOT be weight decayed
+                    no_decay.add(fpn)
+
+        # special case the position embedding parameter in the root GPT module as not decayed
+        #no_decay.add('pos_emb')
+        #no_decay.add('global_pos_emb')
+
+        no_decay.add('image_pos_enc')
+        no_decay.add('positional_embedding')
+
+        # validate that we considered every parameter
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params), )
+
+        # create the pytorch optimizer object
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
+        return optimizer

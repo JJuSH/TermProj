@@ -32,12 +32,12 @@ from collections import deque
 import random
 import cv2
 import torch
-
+import pdb
 
 class TrainerConfig:
     # optimization parameters
     max_epochs = 10
-    batch_size = 64
+    batch_size = 8
     learning_rate = 3e-4
     betas = (0.9, 0.95)
     grad_norm_clip = 1.0
@@ -74,6 +74,49 @@ class Trainer:
         #logger.info("saving %s", self.config.ckpt_path)
         # torch.save(raw_model.state_dict(), self.config.ckpt_path)
 
+    def _preprocess_data(self, x, y, r, t):
+        
+        # x states: (batch, block_size, 4*84*84)     torch.Size([128, 30, 28224])
+        # y actions: (batch, block_size, 1)          torch.Size([128, 30, 1])
+        # y targets: (batch, block_size, 1)          torch.Size([128, 30, 1])
+        # r rtgs: (batch, block_size, 1)             torch.Size([128, 30, 1])
+        # t timesteps: (batch, 1, 1)                 torch.Size([128, 1, 1])
+        #pdb.set_trace()
+
+        # 3 for action stack, 1 for rtgs -> rew
+        res_action = 3
+        res_rew = 1
+
+        batch_size = x.shape[0]
+
+        seq_len = x.shape[1] - res_action - res_rew
+
+        obs = x.reshape((batch_size, x.shape[1], 4, 84, 84))[:, res_action : -res_rew , :, :, :]
+
+        index = torch.range(0, seq_len * 4 - 1)
+        index_sub = 3 * torch.flatten(torch.unsqueeze(torch.range(0, seq_len - 1), dim = -1).expand(-1, 4))
+        index = (index - index_sub).repeat(batch_size, 1)
+        index = index.type(torch.LongTensor)
+
+        action = torch.squeeze(y)
+        action = torch.gather(action, 1, index).reshape(batch_size, seq_len, -1)
+
+        rtgs = torch.squeeze(r)
+        rtgs = torch.gather(rtgs, 1, index).reshape(batch_size, seq_len, -1)
+
+        rew = torch.squeeze(r)
+        rew = rew - torch.roll(rew, (0, -1), (0, 1))
+        rew = torch.gather(rew, 1, index).reshape(batch_size, seq_len, -1)
+
+        inputs = {}
+
+        inputs["observations"] = obs   # torch.Size([8, 4, 1, 84, 84])
+        inputs["returns-to-go"] = rtgs  # torch.Size([8, 4])
+        inputs["actions"] = action        # torch.Size([8, 4])
+        inputs["rewards"] = rew        # torch.Size([8, 4])
+
+        return inputs
+
     def train(self):
         model, config = self.model, self.config
         raw_model = model.module if hasattr(self.model, "module") else model
@@ -88,19 +131,28 @@ class Trainer:
                                 num_workers=config.num_workers)
 
             losses = []
+            
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
             for it, (x, y, r, t) in pbar:
 
                 # place data on the correct device
-                x = x.to(self.device)
-                y = y.to(self.device)
-                r = r.to(self.device)
-                t = t.to(self.device)
+                #x = x.to(self.device) # 512 x 30 x (4 x 84 x 84)
+                #y = y.to(self.device)
+                #r = r.to(self.device)
+                #t = t.to(self.device)
+
+                inputs = self._preprocess_data(x, y, r, t)
+
+                inputs["observations"].to(self.device)   
+                inputs["returns-to-go"].to(self.device)  
+                inputs["actions"].to(self.device)    
 
                 # forward the model
                 with torch.set_grad_enabled(is_train):
                     # logits, loss = model(x, y, r)
-                    logits, loss = model(x, y, y, r, t)
+                    # logits, loss = model(x, y, y, r, t)
+                    
+                    result_dict = model(inputs)
                     loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
                     losses.append(loss.item())
 

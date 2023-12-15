@@ -80,9 +80,10 @@ class SequenceEnvironmentWrapper(gym.Wrapper):
 
     def step(self, action: np.ndarray):
         """Replaces env observation with fixed length observation history."""
+        #pdb.set_trace()
         # Update applied action to the previous timestep.
         self.act_stack[-1] = action
-        obs, rew, done, info = self.env.step(action)
+        obs, rew, done, info = self.env.step(action)     # AtariPreprocessing result, obs.shape : (84, 84) finished frame skip
         if self.jpeg_obs:
             obs = self._process_jpeg(obs)
         self.rew_stack[-1] = rew
@@ -221,13 +222,19 @@ model = model.to(device=device)
 
 model.train()
 
-print("###############")
+##########################################################################################################
 
 from create_dataset import create_dataset
 from multigame_dt_trainer import Trainer, TrainerConfig
 from torch.utils.data import Dataset
 
-pdb.set_trace()
+from torchvision.utils import save_image
+
+#images.shape #torch.Size([64,3,28,28])
+#img1 = images[0] #torch.Size([3,28,28]
+# img1 = img1.numpy() # TypeError: tensor or list of tensors expected, got <class 'numpy.ndarray'>
+#save_image(img1, 'img1.png')
+
 class StateActionReturnDataset(Dataset):
 
     def __init__(self, data, block_size, actions, done_idxs, rtgs, timesteps):        
@@ -261,27 +268,50 @@ class StateActionReturnDataset(Dataset):
 # python run_dt_atari.py --seed $seed --context_length 50 --epochs 5 --model_type 'reward_conditioned' --num_steps 500000 --num_buffers 50 --game 'Pong' --batch_size 512
 
 epochs = 5
-num_steps = 200000
+num_steps = 5000
 num_buffers = 50
 game = 'Pong'
-batch_size = 512
+batch_size = 2
 data_dir_prefix = './dqn_replay/'
 trajectories_per_buffer = 10
-context_length = 30
+#context_length = 30
+context_length = 14   # 3 for action stack, 1 for rtgs -> rew
 seed = 123
 model_type = 'reward_conditioned'
 
+#pdb.set_trace()
+
+# obss[0].shape : (4, 84, 84) len 88831 list
+# actions.shape : (88831,)
+# returns.shape : (34,)
+# done_idxs.shape : (33,)
+# rtgs.shape : (88831,)
+# timesteps.shape : (88832,)
+
 obss, actions, returns, done_idxs, rtgs, timesteps = create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_per_buffer)
 train_dataset = StateActionReturnDataset(obss, context_length*3, actions, done_idxs, rtgs, timesteps)
+
+image_idx = [0, 100, 200, 300, 400, 500]
+for idx in image_idx:
+    image = torch.Tensor(obss[idx])/255
+    for i in range(4):
+        
+        zero_image = torch.zeros_like(image)
+        zero_image[i] = image[i]
+        save_image(zero_image, './test_image/img' + str(idx) + "_" + str(i) + '.png')
+
+    save_image(image, 'test_image/img' + str(idx) + '.png')
+
 
 tconf = TrainerConfig(max_epochs=epochs, batch_size=batch_size, learning_rate=6e-4,
                       lr_decay=True, warmup_tokens=512*20, final_tokens=2*len(train_dataset)*context_length*3,
                       num_workers=4, seed=seed, model_type=model_type, game=game, max_timestep=max(timesteps))
 trainer = Trainer(model, train_dataset, None, tconf)
 
+
 trainer.train()
 
-
+##########################################################################################################
 
 # --- Save/Load model weights
 # torch.save(model.state_dict(), "model.pth")
@@ -309,8 +339,9 @@ def _batch_rollout(envs, policy_fn, num_episodes, log_interval=None):
         done = np.zeros(num_batch, dtype=np.int32)
         start = time.perf_counter()
         for t in range(num_steps):
+            
             done_prev = done
-            obs = {k: torch.tensor(v, device=device) for k, v in obs.items()}
+            obs = {k: torch.tensor(v, device=device) for k, v in obs.items()} # obs['observations'] : 8 x 4 x 1 x 84 x 84     4 - num stack frame
             actions = policy_fn(obs, rng=rng, deterministic=False)
 
             # Collect step results and stack as a batch.

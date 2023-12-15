@@ -23,7 +23,7 @@ import cv2
 import gym
 import numpy as np
 from gym.spaces.box import Box
-
+import pdb
 
 class AtariPreprocessing(gym.Wrapper):
     """A class implementing image preprocessing for Atari 2600 agents.
@@ -154,7 +154,7 @@ class AtariPreprocessing(gym.Wrapper):
           info: Gym API's info data structure.
         """
         accumulated_reward = 0.0
-
+        
         for time_step in range(self.frame_skip):
             # We bypass the Gym observation altogether and directly fetch the
             # grayscale image from the ALE. This is a little faster.
@@ -173,13 +173,13 @@ class AtariPreprocessing(gym.Wrapper):
             # We max-pool over the last two frames, in grayscale.
             elif time_step >= self.frame_skip - 2:
                 t = time_step - (self.frame_skip - 2)
-                self._fetch_grayscale_observation(self.screen_buffer[t])
+                self._fetch_grayscale_observation(self.screen_buffer[t]) # self.screen_buffer : list type length 2 , self.screen_buffer[0].shape = (210, 160)
 
         # Pool the last two observations.
         observation = self._pool_and_resize()
 
         self.game_over = game_over
-        return observation, accumulated_reward, is_terminal, info
+        return observation, accumulated_reward, is_terminal, info    # observation.shape : (84, 84)
 
     def _fetch_grayscale_observation(self, output):
         """Returns the current observation in grayscale.
