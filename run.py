@@ -223,7 +223,7 @@ model = model.to(device=device)
 model.train()
 
 ##########################################################################################################
-
+"""
 from create_dataset import create_dataset
 from multigame_dt_trainer import Trainer, TrainerConfig
 from torch.utils.data import Dataset
@@ -267,11 +267,11 @@ class StateActionReturnDataset(Dataset):
 
 # python run_dt_atari.py --seed $seed --context_length 50 --epochs 5 --model_type 'reward_conditioned' --num_steps 500000 --num_buffers 50 --game 'Pong' --batch_size 512
 
-epochs = 5
+epochs = 1
 num_steps = 5000
 num_buffers = 50
-game = 'Pong'
-batch_size = 2
+game = 'Breakout'
+batch_size = 16
 data_dir_prefix = './dqn_replay/'
 trajectories_per_buffer = 10
 #context_length = 30
@@ -291,16 +291,16 @@ model_type = 'reward_conditioned'
 obss, actions, returns, done_idxs, rtgs, timesteps = create_dataset(num_buffers, num_steps, game, data_dir_prefix, trajectories_per_buffer)
 train_dataset = StateActionReturnDataset(obss, context_length*3, actions, done_idxs, rtgs, timesteps)
 
-image_idx = [0, 100, 200, 300, 400, 500]
-for idx in image_idx:
-    image = torch.Tensor(obss[idx])/255
-    for i in range(4):
-        
-        zero_image = torch.zeros_like(image)
-        zero_image[i] = image[i]
-        save_image(zero_image, './test_image/img' + str(idx) + "_" + str(i) + '.png')
-
-    save_image(image, 'test_image/img' + str(idx) + '.png')
+#image_idx = [0, 100, 200, 300, 400, 500]
+#for idx in image_idx:
+#    image = torch.Tensor(obss[idx])/255
+#    for i in range(4):
+#        
+#        zero_image = torch.zeros_like(image)
+#        zero_image[i] = image[i]
+#        save_image(zero_image, './test_image/img' + str(idx) + "_" + str(i) + '.png')
+#
+#    save_image(image, 'test_image/img' + str(idx) + '.png')
 
 
 tconf = TrainerConfig(max_epochs=epochs, batch_size=batch_size, learning_rate=6e-4,
@@ -310,12 +310,12 @@ trainer = Trainer(model, train_dataset, None, tconf)
 
 
 trainer.train()
-
+"""
 ##########################################################################################################
 
 # --- Save/Load model weights
-# torch.save(model.state_dict(), "model.pth")
-# model.load_state_dict(torch.load("model.pth"))
+torch.save(model.state_dict(), "model.pth")
+model.load_state_dict(torch.load("model.pth"))
 
 # --- Evaluate model
 def _batch_rollout(envs, policy_fn, num_episodes, log_interval=None):

@@ -33,6 +33,7 @@ import random
 import cv2
 import torch
 import pdb
+import os
 
 class TrainerConfig:
     # optimization parameters
@@ -64,6 +65,7 @@ class Trainer:
 
         # take over whatever gpus are on the system
         self.device = 'cpu'
+        
         if torch.cuda.is_available():
             self.device = torch.cuda.current_device()
             self.model = torch.nn.DataParallel(self.model).to(self.device)
@@ -74,14 +76,14 @@ class Trainer:
         #logger.info("saving %s", self.config.ckpt_path)
         # torch.save(raw_model.state_dict(), self.config.ckpt_path)
 
-    def _preprocess_data(self, x, y, r, t):
+    def _preprocess_data(self, x, x_aug, y, r, t):
         
         # x states: (batch, block_size, 4*84*84)     torch.Size([128, 30, 28224])
         # y actions: (batch, block_size, 1)          torch.Size([128, 30, 1])
         # y targets: (batch, block_size, 1)          torch.Size([128, 30, 1])
         # r rtgs: (batch, block_size, 1)             torch.Size([128, 30, 1])
         # t timesteps: (batch, 1, 1)                 torch.Size([128, 1, 1])
-        #pdb.set_trace()
+        
 
         # 3 for action stack, 1 for rtgs -> rew
         res_action = 3
@@ -92,6 +94,7 @@ class Trainer:
         seq_len = x.shape[1] - res_action - res_rew
 
         obs = x.reshape((batch_size, x.shape[1], 4, 84, 84))[:, res_action : -res_rew , :, :, :]
+        obs_aug = x_aug.reshape((batch_size, x.shape[1], 4, 84, 84))[:, res_action : -res_rew , :, :, :]
 
         index = torch.range(0, seq_len * 4 - 1)
         index_sub = 3 * torch.flatten(torch.unsqueeze(torch.range(0, seq_len - 1), dim = -1).expand(-1, 4))
@@ -111,11 +114,34 @@ class Trainer:
         inputs = {}
 
         inputs["observations"] = obs   # torch.Size([8, 4, 1, 84, 84])
+        inputs["observations_aug"] = obs_aug
         inputs["returns-to-go"] = rtgs  # torch.Size([8, 4])
         inputs["actions"] = action        # torch.Size([8, 4])
         inputs["rewards"] = rew        # torch.Size([8, 4])
 
         return inputs
+
+    def _image_aug_cutout(x, min_cut=10,max_cut=30):
+    """
+        args:
+        imgs: np.array shape (B,C,H,W)
+        min / max cut: int, min / max size of cutout 
+        returns np.array
+    """
+    B, T, C, H, W = x.shape
+    imgs = x.reshape(-1, C, H, W)
+    
+    n, c, h, w = imgs.shape
+    w1 = np.random.randint(min_cut, max_cut, n)
+    h1 = np.random.randint(min_cut, max_cut, n)
+    
+    cutouts = np.empty((n, c, h, w), dtype=imgs.dtype)
+    for i, (img, w11, h11) in enumerate(zip(imgs, w1, h1)):
+        cut_img = img.copy()
+        cut_img[:, h11:h11 + h11, w11:w11 + w11] = 0
+        #print(img[:, h11:h11 + h11, w11:w11 + w11].shape)
+        cutouts[i] = cut_img
+    return cutouts
 
     def train(self):
         model, config = self.model, self.config
@@ -140,20 +166,22 @@ class Trainer:
                 #y = y.to(self.device)
                 #r = r.to(self.device)
                 #t = t.to(self.device)
-
-                inputs = self._preprocess_data(x, y, r, t)
+                x_aug = _image_aug_cutout(x, 10, 30)
+                inputs = self._preprocess_data(x, aug_x, y, r, t)
 
                 inputs["observations"].to(self.device)   
                 inputs["returns-to-go"].to(self.device)  
                 inputs["actions"].to(self.device)    
-
+                inputs["rewards"].to(self.device)
                 # forward the model
+                
                 with torch.set_grad_enabled(is_train):
                     # logits, loss = model(x, y, r)
                     # logits, loss = model(x, y, y, r, t)
                     
                     result_dict = model(inputs)
-                    loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
+                    #loss = loss.mean()
+                    loss = result_dict['loss'].mean() # collapse all losses if they are scattered on multiple gpus
                     losses.append(loss.item())
 
                 if is_train:
@@ -207,6 +235,8 @@ class Trainer:
             #     self.save_checkpoint()
 
             # -- pass in target returns
+
+            """
             if self.config.model_type == 'naive':
                 eval_return = self.get_returns(0)
             elif self.config.model_type == 'reward_conditioned':
@@ -222,7 +252,8 @@ class Trainer:
                     raise NotImplementedError()
             else:
                 raise NotImplementedError()
-
+            """
+"""
     def get_returns(self, ret):
         self.model.train(False)
         args=Args(self.config.game.lower(), self.config.seed)
@@ -369,3 +400,4 @@ class Args:
         self.max_episode_length = 108e3
         self.game = game
         self.history_length = 4
+"""

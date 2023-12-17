@@ -81,7 +81,7 @@ class Attention(nn.Module):
             nn.init.zeros_(self.proj.bias)
 
     def forward(self, x, mask: Optional[Tensor] = None) -> Tensor:
-        pdb.set_trace()
+        
         B, T, C = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
@@ -325,10 +325,11 @@ class MultiGameDecisionTransformer(nn.Module):
         image_emb = image_emb + self.image_pos_enc
         return image_emb
 
-    def _embed_inputs(self, obs: Tensor, ret: Tensor, act: Tensor, rew: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def _embed_inputs(self, obs: Tensor, obs_aug: Tensor, ret: Tensor, act: Tensor, rew: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         # Embed only prefix_frames first observations.
         # obs are [B x T x C x H x W]
         obs_emb = self._image_embedding(obs) # obs_emb : torch.Size([64, 30, 4, 36, 1280]) 
+        obs_aug_emb = self._image_embedding(obs_aug)
         # Embed returns and actions
         # Encode returns.
         ret = encode_return(ret, self.return_range)
@@ -339,7 +340,7 @@ class MultiGameDecisionTransformer(nn.Module):
             rew_emb = self.rew_emb(rew)      # rew_emb : torch.Size([64, 30, 4, 1280])
         else:
             rew_emb = None
-        return obs_emb, ret_emb, act_emb, rew_emb   
+        return obs_emb, obs_aug_emb, ret_emb, act_emb, rew_emb   
 
     def _image_embedding_inf(self, image: Tensor):
         r"""Embed [B x T x C x W x H] images to tokens [B x T x output_dim] tokens.
@@ -408,8 +409,9 @@ class MultiGameDecisionTransformer(nn.Module):
 
         
 
-        obs_emb, ret_emb, act_emb, rew_emb = self._embed_inputs(
+        obs_emb, obs_aug_emb, ret_emb, act_emb, rew_emb = self._embed_inputs(
             inputs["observations"],   # torch.Size([8, 4, 1, 84, 84])    ->    128, 30, 4, 84, 84
+            inputs["observations_aug"],
             inputs["returns-to-go"],  # torch.Size([8, 4])               ->    128, 30, 4
             inputs["actions"],        # torch.Size([8, 4])               ->    128, 30, 4
             inputs["rewards"],        # torch.Size([8, 4])               ->    128, 30, 4
@@ -507,14 +509,20 @@ class MultiGameDecisionTransformer(nn.Module):
             custom_causal_mask = torch.tensor(custom_causal_mask, dtype=torch.bool, device=device)
 
             #custom_causal_mask = custom_causal_mask.repeat(num_seq, 0)
-
-      
+        
         output_emb = self.transformer(token_emb, mask, custom_causal_mask) # torch.Size([64, 30, 156, 1280])    mask : torch.Size([64, 30, 156])      custom_causal_mask : torch.Size([156, 156])
 
         # Output_embeddings are [B x 3T x D].   8 x 156 x 1280
         # Next token predictions (tokens one before their actual place).
-        ret_pred = output_emb[:, (num_obs_tokens - 1) :: tokens_per_step, :]
-        act_pred = output_emb[:, (num_obs_tokens - 0) :: tokens_per_step, :]
+
+        output_emb = output_emb.reshape(batch_size, num_seq, num_steps * tokens_per_step, -1)
+        #ret_pred = output_emb[:, (num_obs_tokens - 1) :: tokens_per_step, :]
+        #act_pred = output_emb[:, (num_obs_tokens - 0) :: tokens_per_step, :]
+
+        ret_pred = output_emb[:, :, (num_obs_tokens - 1) :: tokens_per_step, :]
+        act_pred = output_emb[:, :, (num_obs_tokens - 0) :: tokens_per_step, :]
+
+
         embeds = torch.cat([ret_pred, act_pred], dim=-1)
         # Project to appropriate dimensionality.
         ret_pred = self.ret_linear(ret_pred)
@@ -526,17 +534,19 @@ class MultiGameDecisionTransformer(nn.Module):
             "return_logits": ret_pred,
         }
         if self.predict_reward:
-            rew_pred = output_emb[:, (num_obs_tokens + 1) :: tokens_per_step, :]
+            #rew_pred = output_emb[:, (num_obs_tokens + 1) :: tokens_per_step, :]
+            rew_pred = output_emb[:, :, (num_obs_tokens + 1) :: tokens_per_step, :]
             rew_pred = self.rew_linear(rew_pred)
             result_dict["reward_logits"] = rew_pred
         # Return evaluation metrics.
+        
         result_dict["loss"] = self.sequence_loss(inputs, result_dict)
-        result_dict["accuracy"] = self.sequence_accuracy(inputs, result_dict)
+        #result_dict["accuracy"] = self.sequence_accuracy(inputs, result_dict)
         return result_dict
 
     def forward_inf(self, inputs: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
 
-        #pdb.set_trace()
+        
         r"""Process sequence."""
         num_batch = inputs["actions"].shape[0]
         num_steps = inputs["actions"].shape[1]
@@ -621,13 +631,21 @@ class MultiGameDecisionTransformer(nn.Module):
             custom_causal_mask = np.logical_or(sequential_causal_mask, block_diag)
             custom_causal_mask = torch.tensor(custom_causal_mask, dtype=torch.bool, device=device)
 
-        pdb.set_trace()
+        
         output_emb = self.transformer(token_emb, mask, custom_causal_mask) # token_emb : 8 x 156 x 1280       mask : torch.Size([8, 156])       custom_causal_mask : torch.Size([156, 156]
 
         # Output_embeddings are [B x 3T x D].   8 x 156 x 1280
         # Next token predictions (tokens one before their actual place).
-        ret_pred = output_emb[:, (num_obs_tokens - 1) :: tokens_per_step, :]
-        act_pred = output_emb[:, (num_obs_tokens - 0) :: tokens_per_step, :]
+        
+
+        #>>> a[:]
+        #tensor([ 0.,  1.,  2.,  3.,  4.,  5.,  6.,  7.,  8.,  9., 10.])
+        #>>> a[1::3]
+        #tensor([ 1.,  4.,  7., 10.])
+
+
+        ret_pred = output_emb[:, (num_obs_tokens - 1) :: tokens_per_step, :]  # ret_pred : torch.Size([8, 4, 1280])   return-act-rew 순으로 concat
+        act_pred = output_emb[:, (num_obs_tokens - 0) :: tokens_per_step, :]  # act_pred : torch.Size([8, 4, 1280])
         embeds = torch.cat([ret_pred, act_pred], dim=-1)
         # Project to appropriate dimensionality.
         ret_pred = self.ret_linear(ret_pred)
@@ -649,17 +667,27 @@ class MultiGameDecisionTransformer(nn.Module):
 
     def _objective_pairs(self, inputs: Mapping[str, Tensor], model_outputs: Mapping[str, Tensor]) -> Tensor:
         r"""Get logit-target pairs for the model objective terms."""
-        act_target = inputs["actions"]
-        ret_target = encode_return(inputs["returns-to-go"], self.return_range)
-        act_logits = model_outputs["action_logits"]
-        ret_logits = model_outputs["return_logits"]
+        
+        act_target = inputs["actions"]   # torch.Size([8, 4])      ------------       torch.Size([4, 10, 4])
+        ret_target = encode_return(inputs["returns-to-go"], self.return_range) 
+        # inputs['returns-to-go'].shape : torch.Size([8, 4])    ret_target.shape : torch.Size([8, 4])  
+        # inputs['returns-to-go'].shape : torch.Size([4, 10, 4])    ret_target.shape : torch.Size([4, 10, 4])
+        act_logits = model_outputs["action_logits"]  # act_logits.shape : torch.Size([8, 4, 18])    ----------- act_logits.shape : torch.Size([4, 10, 4, 18])
+        ret_logits = model_outputs["return_logits"]  # ret_logits.shape : torch.Size([8, 4, 120])   ----------- ret_logits.shape : torch.Size([4, 10, 4, 120])
+
+
         if self.single_return_token:
-            ret_target = ret_target[:, :1]
-            ret_logits = ret_logits[:, :1, :]
+
+            if len(act_target.shape) == 3:
+                ret_target = ret_target[:, :, :1]
+                ret_logits = ret_logits[:, :, :1, :]
+            else:
+                ret_target = ret_target[:, :1]           # ret_target.shape : torch.Size([8, 1])        ----------- ?
+                ret_logits = ret_logits[:, :1, :]        # ret_logits.shape : torch.Size([8, 1, 120])   ----------- ?
         obj_pairs = [(act_logits, act_target), (ret_logits, ret_target)]
         if self.predict_reward:
-            rew_target = encode_reward(inputs["rewards"])
-            rew_logits = model_outputs["reward_logits"]
+            rew_target = encode_reward(inputs["rewards"])   # inputs["rewards"].shape : torch.Size([8, 4])        rew_target.shape : torch.Size([8, 4])  ------ inputs["rewards"].shape : torch.Size([4, 10, 4])      rew_target.shape : torch.Size([4, 10, 4])   
+            rew_logits = model_outputs["reward_logits"]     # rew_logits.shape : torch.Size([8, 4, 4])  --------- rew_logits.shape : torch.Size([4, 10, 4, 4])
             obj_pairs.append((rew_logits, rew_target))
         return obj_pairs
 
